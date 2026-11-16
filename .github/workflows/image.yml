@@ -1,0 +1,198 @@
+name: image
+
+# Reusable: build the repository's Dockerfile, optionally smoke-test it, push it to
+# ghcr.io/<owner>/<repo> (lowercase) and attest it. Outputs the pushed digest for deploy.yml.
+#
+#   Ref                      Tags pushed
+#   develop                  :develop        :sha-<short>
+#   master | main            :master / :main :sha-<short>
+#   tag X.Y.Z / vX.Y.Z       :X.Y.Z          :sha-<short>
+#   other branches           :sha-<short>
+#   pull request             nothing (build and smoke test only)
+#
+# The caller grants: contents: read, packages: write, id-token: write, attestations: write.
+
+on:
+  workflow_call:
+    inputs:
+      platforms:
+        description: buildx platforms, comma-separated
+        type: string
+        default: linux/amd64
+      build-args:
+        description: Extra build args, one KEY=value per line (IMAGE_TAG=<ref>@<sha> is always added)
+        type: string
+        default: ""
+      cache:
+        description: gha | registry (:buildcache next to the image; works for multi-platform)
+        type: string
+        default: gha
+      context:
+        description: Build context
+        type: string
+        default: .
+      file:
+        description: Dockerfile path (default — <context>/Dockerfile)
+        type: string
+        default: ""
+      prepare:
+        description: Shell command run after checkout, before the build (e.g. export requirements.txt)
+        type: string
+        default: ""
+      smoke-test:
+        description: >-
+          Shell command run against the image before the push. The image is loaded into the
+          local daemon as $SMOKE_IMAGE, built for the first platform only.
+        type: string
+        default: ""
+    outputs:
+      digest:
+        description: Digest of the pushed image (sha256:…), empty on a pull request
+        value: ${{ jobs.image.outputs.digest }}
+      image:
+        description: Image name without tag (ghcr.io/<owner>/<repo>)
+        value: ${{ jobs.image.outputs.image }}
+      tags:
+        description: Tags pushed, one per line
+        value: ${{ jobs.image.outputs.tags }}
+
+permissions: {}
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      image: ${{ steps.vars.outputs.image }}
+      tags: ${{ steps.meta.outputs.tags }}
+    env:
+      PUSH: ${{ github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: vars
+        env:
+          CACHE: ${{ inputs.cache }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          case "$CACHE" in
+            gha)
+              from="type=gha"
+              to="type=gha,mode=max" ;;
+            registry)
+              from="type=registry,ref=${image}:buildcache"
+              to="type=registry,ref=${image}:buildcache,mode=max" ;;
+            *)
+              echo "::error::cache must be gha or registry, got '${CACHE}'"
+              exit 1 ;;
+          esac
+          # A pull request pushes nothing, the registry cache included.
+          [ "$PUSH" = true ] || [ "$CACHE" = gha ] || to=""
+          {
+            echo "image=$image"
+            echo "cache-from=$from"
+            echo "cache-to=$to"
+            echo "smoke-platform=${PLATFORMS%%,*}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare
+        if: inputs.prepare != ''
+        env:
+          PREPARE: ${{ inputs.prepare }}
+        run: eval "$PREPARE"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: contains(inputs.platforms, ',') || !contains(inputs.platforms, 'amd64')
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: env.PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.vars.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ github.ref_name }},enable=${{ github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' }}
+            type=match,pattern=^v?(\d+\.\d+\.\d+)$,group=1
+            type=sha,prefix=sha-,format=short
+
+      # Build once into the local daemon and prove the image works before anything is pushed.
+      # load cannot hold a multi-platform image, hence the first platform only; the push below
+      # reuses its layers from the cache.
+      - name: Build for the smoke test
+        if: inputs.smoke-test != ''
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
+          platforms: ${{ steps.vars.outputs.smoke-platform }}
+          load: true
+          tags: smoke.local/image:${{ github.sha }}
+          build-args: |
+            IMAGE_TAG=${{ github.ref_name }}@${{ github.sha }}
+            ${{ inputs.build-args }}
+          cache-from: ${{ steps.vars.outputs.cache-from }}
+          cache-to: ${{ steps.vars.outputs.cache-to }}
+
+      - name: Smoke test
+        if: inputs.smoke-test != ''
+        env:
+          SMOKE_IMAGE: smoke.local/image:${{ github.sha }}
+          SMOKE_TEST: ${{ inputs.smoke-test }}
+        run: eval "$SMOKE_TEST"
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            IMAGE_TAG=${{ github.ref_name }}@${{ github.sha }}
+            ${{ inputs.build-args }}
+          cache-from: ${{ steps.vars.outputs.cache-from }}
+          cache-to: ${{ steps.vars.outputs.cache-to }}
+          provenance: ${{ env.PUSH == 'true' }}
+          sbom: ${{ env.PUSH == 'true' }}
+
+      - name: Attest
+        if: env.PUSH == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.vars.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            if [ "$PUSH" = true ]; then echo "### Image pushed"; else echo "### Image built (pull request: not pushed)"; fi
+            echo
+            echo "Digest \`${DIGEST:-—}\`"
+            echo
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

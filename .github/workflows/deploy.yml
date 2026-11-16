@@ -1,0 +1,195 @@
+name: deploy
+
+# Reusable: roll the image just pushed out to the environment of the pushed branch, prove the
+# running pods use its digest, and report the deploy to LGTM.
+#
+#   develop        → development, namespace evilflowers-dev, instance dev
+#   master | main  → production, no namespace until prod runs in k3s: the image is pushed and
+#                    this workflow ends as an annotated no-op
+#   anything else  → nothing
+#
+# The table in job `resolve` is the only place environments are defined. At the prod cutover,
+# set ns=evilflowers-prod on the master|main row and release v1.y; no service repository changes.
+#
+# Restarted: every Deployment labelled elvira.stuba.sk/image=<image-label>,
+# app.kubernetes.io/instance=<instance> (labels set by knowledge roles/evilflowers_k8s, on the
+# Deployment and on its pod template). A selector that matches nothing fails the job.
+
+on:
+  workflow_call:
+    inputs:
+      digest:
+        description: Image digest image.yml pushed (sha256:…)
+        type: string
+        required: true
+      image-label:
+        description: Value of elvira.stuba.sk/image (default — the lowercase repository name)
+        type: string
+        default: ""
+      timeout:
+        description: rollout status timeout per Deployment
+        type: string
+        default: 900s
+      actions-ref:
+        description: Ref of evilflowers-actions to load scripts/otlp-deploy.sh from (keep it equal to the @ref you call)
+        type: string
+        default: v1
+
+permissions: {}
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      namespace: ${{ steps.env.outputs.namespace }}
+      instance: ${{ steps.env.outputs.instance }}
+      url: ${{ steps.env.outputs.url }}
+      label: ${{ steps.env.outputs.label }}
+      image: ${{ steps.env.outputs.image }}
+    steps:
+      - id: env
+        env:
+          IMAGE_LABEL: ${{ inputs.image-label }}
+        run: |
+          case "$GITHUB_REF" in
+            refs/heads/develop)
+              env=development ns=evilflowers-dev inst=dev  url=https://dev.evilflowers.elvira.stuba.sk ;;
+            refs/heads/master|refs/heads/main)
+              env=production  ns=""              inst=prod url=https://evilflowers.elvira.stuba.sk ;;  # ns=evilflowers-prod at the k3s cutover
+            *)
+              env=""          ns=""              inst=""   url="" ;;
+          esac
+          label="${IMAGE_LABEL:-${GITHUB_REPOSITORY#*/}}"
+          label="${label,,}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          {
+            echo "environment=$env"
+            echo "namespace=$ns"
+            echo "instance=$inst"
+            echo "url=$url"
+            echo "label=$label"
+            echo "image=$image"
+          } >> "$GITHUB_OUTPUT"
+          if [ -z "$env" ]; then
+            msg="$GITHUB_REF deploys nowhere; image pushed, nothing restarted"
+          elif [ -z "$ns" ]; then
+            msg="$env is not on k3s yet; image pushed, nothing restarted"
+          else
+            msg="$GITHUB_REF → $env (namespace $ns, elvira.stuba.sk/image=$label, instance $inst)"
+          fi
+          echo "::notice::$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
+  rollout:
+    needs: resolve
+    # The owner check keeps a fork's push from queueing forever for a runner it may not use.
+    if: needs.resolve.outputs.namespace != '' && github.repository_owner == 'EvilFlowersCatalog'
+    runs-on: elvira-k3s            # ARC scale set inside k3s (knowledge: roles/github_runner)
+    environment:
+      name: ${{ needs.resolve.outputs.environment }}
+      url: ${{ needs.resolve.outputs.url }}
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ needs.resolve.outputs.namespace }}
+      cancel-in-progress: false
+    permissions: {}
+    env:
+      TARGET_ENVIRONMENT: ${{ needs.resolve.outputs.environment }}
+      TARGET_NAMESPACE: ${{ needs.resolve.outputs.namespace }}
+      # Matches the Deployments and their pods alike.
+      SELECTOR: elvira.stuba.sk/image=${{ needs.resolve.outputs.label }},app.kubernetes.io/instance=${{ needs.resolve.outputs.instance }}
+      IMAGE: ${{ needs.resolve.outputs.image }}
+      DIGEST: ${{ inputs.digest }}
+      ROLLOUT_TIMEOUT: ${{ inputs.timeout }}
+      ACTIONS_REF: ${{ inputs.actions-ref }}
+      # The one place to bump at a k3s upgrade.
+      KUBECTL_VERSION: v1.31.5     # = the cluster (k3s v1.31.5+k3s1)
+      KUBECTL_SHA256: fbecbfd375b3686002c2e81d51c390172f5ffba3d6b47920d55342cb03f557af   # dl.k8s.io …/linux/amd64/kubectl.sha256
+    steps:
+      # The runner image has no kubectl. The pod is deleted after the job, so nothing is cached.
+      - name: kubectl ${{ env.KUBECTL_VERSION }} (checksum-pinned)
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  $RUNNER_TEMP/kubectl" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/kubectl"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      # In-cluster credentials: the pod's ServiceAccount arc-deployer, limited to
+      # github_runner_deploy_namespaces. A selector that matches nothing would make
+      # `rollout restart` a silent no-op: fail instead (e.g. the label not applied yet).
+      - name: Restart onto the new image
+        run: |
+          deployments=$(kubectl -n "$TARGET_NAMESPACE" get deployment -l "$SELECTOR" \
+            -o go-template='{{range .items}}{{with index .metadata.labels "app.kubernetes.io/name"}}{{.}}{{else}}{{.metadata.name}}{{end}}{{" "}}{{end}}')
+          echo "DEPLOY_DEPLOYMENTS=${deployments% }" >> "$GITHUB_ENV"
+          echo "Deployments: ${deployments:-none}"
+          if [ -z "$deployments" ]; then
+            echo "::error::no Deployment in $TARGET_NAMESPACE matches $SELECTOR"
+            exit 1
+          fi
+          echo "DEPLOY_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+          kubectl -n "$TARGET_NAMESPACE" rollout restart deployment -l "$SELECTOR"
+
+      # Each Deployment gets the full budget: some wait for another in an init container
+      # (the catalog's worker and beat wait for the web pod's migrations).
+      - name: Wait for the rollout
+        run: |
+          for d in $(kubectl -n "$TARGET_NAMESPACE" get deployment -l "$SELECTOR" -o name); do
+            kubectl -n "$TARGET_NAMESPACE" rollout status "$d" --timeout="$ROLLOUT_TIMEOUT"
+          done
+
+      # The tag could have moved, or the pull could have failed silently onto a cached image.
+      # Init containers run the same image and are checked too. Pods still terminating are
+      # skipped.
+      - name: Running pods use ${{ env.DIGEST }}
+        run: |
+          # shellcheck disable=SC2016  # $pod is a go-template variable, not a shell one
+          ids=$(kubectl -n "$TARGET_NAMESPACE" get pods -l "$SELECTOR" \
+            -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{$pod := .metadata.name}}{{range .status.initContainerStatuses}}{{$pod}} {{.name}} {{.imageID}}{{"\n"}}{{end}}{{range .status.containerStatuses}}{{$pod}} {{.name}} {{.imageID}}{{"\n"}}{{end}}{{end}}{{end}}')
+          echo "$ids"
+          test -n "$ids"
+          if echo "$ids" | grep -v -- "@${DIGEST}\$"; then
+            echo "::error::a running pod does not use ${DIGEST}"
+            exit 1
+          fi
+          echo "DEPLOY_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      # Loki event + Tempo span to the node's Alloy. Never fails the job. The script is fetched
+      # anonymously (this repository is public) because a called workflow's checkout is the
+      # caller's repository. A run superseded by a newer push (cancelled) reports nothing: it is
+      # neither a successful nor a failed deploy, and the newer run reports its own.
+      - name: Report the deploy to LGTM
+        id: otlp
+        if: success() || failure()
+        env:
+          OUTCOME: ${{ job.status == 'success' && 'succeeded' || 'failed' }}
+        run: |
+          script="$RUNNER_TEMP/otlp-deploy.sh"
+          if curl -fsSL --max-time 20 -o "$script" \
+            "https://raw.githubusercontent.com/EvilFlowersCatalog/evilflowers-actions/${ACTIONS_REF}/scripts/otlp-deploy.sh"; then
+            bash "$script" "$OUTCOME" || echo "::warning::otlp-deploy.sh failed; the deploy itself is unaffected"
+          else
+            echo "::warning::could not fetch otlp-deploy.sh at ${ACTIONS_REF}; deploy event not sent"
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          TRACE_ID: ${{ steps.otlp.outputs.trace_id }}
+          STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### Deploy to ${TARGET_NAMESPACE} (${TARGET_ENVIRONMENT}): ${STATUS}"
+            echo
+            echo "- Deployments: \`${DEPLOY_DEPLOYMENTS:-none}\` (\`${SELECTOR}\`)"
+            echo "- Image: \`${IMAGE}@${DIGEST}\`"
+            echo "- Commit: \`${GITHUB_SHA::7}\` on \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "Grafana (VPN): http://grafana.observability.stu.k8s.internal → Explore"
+            echo "- Loki: \`{service_name=\"github-actions\"} | event_name=\"deployment\" | vcs_ref_head_revision=\"${GITHUB_SHA}\"\`"
+            if [ -n "$TRACE_ID" ]; then
+              echo "- Tempo: trace \`${TRACE_ID}\`"
+            fi
+            echo "- Tempo: \`{ resource.service.name = \"github-actions\" && name = \"deploy\" }\`"
+          } >> "$GITHUB_STEP_SUMMARY"

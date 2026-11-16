@@ -1,0 +1,52 @@
+name: self-test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # actionlint runs shellcheck on every run: block too (the image bundles it).
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+      # The telemetry contract, without a collector: the payloads are valid JSON with the
+      # expected shape, and a missing endpoint is a warning, never a failure.
+      - name: otlp-deploy.sh
+        env:
+          TARGET_ENVIRONMENT: development
+          TARGET_NAMESPACE: evilflowers-dev
+          DEPLOY_DEPLOYMENTS: web worker
+          DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
+          IMAGE: ghcr.io/evilflowerscatalog/example
+          DEPLOY_START_NS: "1700000000000000000"
+          DEPLOY_END_NS: "1700000060000000000"
+        run: |
+          unset GITHUB_OUTPUT
+          scripts/otlp-deploy.sh --print failed > "$RUNNER_TEMP/payloads"
+          python3 - "$RUNNER_TEMP/payloads" <<'EOF'
+          import json, sys
+          logs, traces = (json.loads(l) for l in open(sys.argv[1]))
+          records = logs["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+          span = traces["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+          assert [r["body"]["stringValue"] for r in records] == ["deployment web failed", "deployment worker failed"]
+          assert len(span["traceId"]) == 32 and len(span["spanId"]) == 16
+          assert all(r["traceId"] == span["traceId"] and r["spanId"] == span["spanId"] for r in records)
+          assert span["name"] == "deploy" and span["status"]["code"] == 2
+          assert span["startTimeUnixNano"] == "1700000000000000000"
+          print("payloads ok")
+          EOF
+          env -u ELVIRA_OTLP_HTTP_ENDPOINT scripts/otlp-deploy.sh succeeded
+          ELVIRA_OTLP_HTTP_ENDPOINT=http://127.0.0.1:9 scripts/otlp-deploy.sh succeeded

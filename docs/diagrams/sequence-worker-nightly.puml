@@ -1,0 +1,44 @@
+@startuml sequence-worker-nightly
+' What: the shared worker-kit contract (evilflowers-worker#13) as evilflowers-actions implements it. A kit consumer's
+'       caller workflows use worker-nightly.yml, the resolve-worker and report-nightly-failure actions, image.yml
+'       and deploy.yml. Every build locks evilflowers-worker to the ref its branch follows (develop: master; main,
+'       master and tags: the newest release tag); every night dev is rebuilt when master moved; every deploy lands
+'       in Loki and Tempo.
+' Source: .github/workflows/worker-nightly.yml, image.yml, deploy.yml, .github/actions/resolve-worker,
+'         .github/actions/report-nightly-failure, scripts/otlp-deploy.sh (this repo, 2026-11-22); reference
+'         evilflowers-analyzer-service docs/diagrams/sequence-nightly-worker-bump.puml.
+!include elvira.iuml
+title Nightly: kit master -> <service>:develop -> evilflowers-dev
+
+participant "worker-nightly.yml" as nightly
+participant "evilflowers-worker\nmaster, v*.*.*" as kit
+participant "GHCR\n:develop" as ghcr
+participant "caller image\nworkflow" as publish
+participant "runner pod\n(elvira-k3s)" as runner
+participant "alloy-node\n:4318" as alloy
+
+nightly -> kit : git ls-remote\nrefs/heads/master
+kit --> nightly : head commit
+nightly -> ghcr : skopeo inspect
+ghcr --> nightly : label ...evilflowers-\nworker.revision
+alt same commit, or held\n(KIT_REF), and not force
+  nightly -> nightly : stop: a rebuild is a\nnew digest, a restart\nfor nothing
+else master moved,\nno label, or force
+  nightly -> publish : gh workflow run\n--ref develop\n-f reason=nightly
+end
+
+group caller image workflow (also on every push)
+  publish -> kit : resolve-worker:\ndevelop -> master,\nmain / tag -> newest v*.*.*\n(no tag = error)
+  kit --> publish : uv.lock + pyproject.toml\n(artifact, never committed)
+  publish -> publish : tests on that lock
+  publish -> ghcr : image.yml: build from\nthe artifact, push,\nlabels ...worker.revision\n/ .ref
+  ghcr --> publish : digest
+  publish -> runner : deploy.yml\n(develop only)
+  runner -> runner : rollout restart,\nstatus, digest check
+  runner -> alloy : POST /v1/logs\nevent.name=deployment,\nevilflowers.deploy.trigger,\nevilflowers.worker.*
+  runner -> alloy : POST /v1/traces\nspan "deploy"
+  opt nightly run failed
+    publish -> publish : report-nightly-failure:\none issue per streak
+  end
+end
+@enduml

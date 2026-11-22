@@ -34,6 +34,20 @@ on:
         description: Ref of evilflowers-actions to load scripts/otlp-deploy.sh from (keep it equal to the @ref you call)
         type: string
         default: v1
+      reason:
+        description: >-
+          What started this deploy, sent as evilflowers.deploy.trigger (push | nightly | manual). Pass the caller's
+          workflow_dispatch input `reason`; empty — the event (push, or manual for a dispatch).
+        type: string
+        default: ""
+      worker-revision:
+        description: evilflowers-worker commit in the image, sent as evilflowers.worker.revision
+        type: string
+        default: ""
+      worker-ref:
+        description: evilflowers-worker ref it was resolved from, sent as evilflowers.worker.ref
+        type: string
+        default: ""
 
 permissions: {}
 
@@ -103,6 +117,9 @@ jobs:
       DIGEST: ${{ inputs.digest }}
       ROLLOUT_TIMEOUT: ${{ inputs.timeout }}
       ACTIONS_REF: ${{ inputs.actions-ref }}
+      TRIGGER: ${{ inputs.reason || (github.event_name == 'workflow_dispatch' && 'manual') || github.event_name }}
+      WORKER_REVISION: ${{ inputs.worker-revision }}
+      WORKER_REF: ${{ inputs.worker-ref }}
       # The one place to bump at a k3s upgrade.
       KUBECTL_VERSION: v1.31.5     # = the cluster (k3s v1.31.5+k3s1)
       KUBECTL_SHA256: fbecbfd375b3686002c2e81d51c390172f5ffba3d6b47920d55342cb03f557af   # dl.k8s.io …/linux/amd64/kubectl.sha256
@@ -180,11 +197,14 @@ jobs:
           STATUS: ${{ job.status }}
         run: |
           {
-            echo "### Deploy to ${TARGET_NAMESPACE} (${TARGET_ENVIRONMENT}): ${STATUS}"
+            echo "### Deploy to ${TARGET_NAMESPACE} (${TARGET_ENVIRONMENT}): ${STATUS} (${TRIGGER})"
             echo
             echo "- Deployments: \`${DEPLOY_DEPLOYMENTS:-none}\` (\`${SELECTOR}\`)"
             echo "- Image: \`${IMAGE}@${DIGEST}\`"
             echo "- Commit: \`${GITHUB_SHA::7}\` on \`${GITHUB_REF_NAME}\`"
+            if [ -n "$WORKER_REVISION" ]; then
+              echo "- evilflowers-worker: \`${WORKER_REF:-?}\` = \`${WORKER_REVISION::7}\`"
+            fi
             echo
             echo "Grafana (VPN): http://grafana.observability.stu.k8s.internal → Explore"
             echo "- Loki: \`{service_name=\"github-actions\"} | event_name=\"deployment\" | vcs_ref_head_revision=\"${GITHUB_SHA}\"\`"

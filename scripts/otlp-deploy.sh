@@ -18,6 +18,9 @@
 #   DEPLOY_START_NS            restart time, ns since epoch (default: now)
 #   DEPLOY_END_NS              end of the digest check, ns since epoch (default: now)
 #   TRACE_ID / SPAN_ID         hex ids to use (default: random)
+#   TRIGGER                    push | nightly | manual → evilflowers.deploy.trigger (default: GITHUB_EVENT_NAME)
+#   WORKER_REVISION            evilflowers-worker commit in the image → evilflowers.worker.revision (sent when set)
+#   WORKER_REF                 evilflowers-worker ref it was resolved from → evilflowers.worker.ref (sent when set)
 #
 # Contract: knowledge vault Proposals/CI-Deploy-Unification.md, "What it sends". Changing an
 # argument or a variable name is a breaking change of v1.
@@ -128,7 +131,15 @@ common=$(join \
   "$(attr cicd.pipeline.run.id "$run_id")" \
   "$(attr cicd.pipeline.run.url.full "$run_url")" \
   "$(attr oci.manifest.digest "${DIGEST:-}")" \
-  "$(attr container.image.name "${IMAGE:-}")")
+  "$(attr container.image.name "${IMAGE:-}")" \
+  "$(attr evilflowers.deploy.trigger "${TRIGGER:-${GITHUB_EVENT_NAME:-}}")")
+# The kit commit (EvilFlowersCatalog/evilflowers-worker#13), only for services built on it.
+if [ -n "${WORKER_REVISION:-}" ]; then
+  common=$(join "$common" "$(attr evilflowers.worker.revision "$WORKER_REVISION")")
+fi
+if [ -n "${WORKER_REF:-}" ]; then
+  common=$(join "$common" "$(attr evilflowers.worker.ref "$WORKER_REF")")
+fi
 
 scope='{"name":"evilflowers-actions/deploy"}'
 

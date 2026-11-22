@@ -25,35 +25,46 @@ evilflowers-worker = { git = "${kit_url}", branch = "master" }
 EOF
 }
 
-# resolve <case> <GITHUB_REF> <KIT_REF> → prints "ref revision"
+# resolve <case> <GITHUB_REF> <KIT_REF> → sets $ref and $rev from the step outputs, as Actions would read them.
+# A real GITHUB_OUTPUT file: on Linux, appending to /dev/stdout of a redirected run reopens the file, and the
+# script's later output overwrites what was appended.
 resolve() {
   local dir="$work/$1"
   consumer "$dir"
-  env -u GITHUB_OUTPUT GITHUB_REF="$2" KIT_REF="$3" PROJECT_DIR="$dir" bash "$script" > "$dir/out" 2>&1 \
-    || { cat "$dir/out" >&2; fail "$1: the script failed"; }
-  printf '%s %s\n' "$(sed -n 's/^ref=//p' "$dir/out")" "$(sed -n 's/^revision=//p' "$dir/out")"
+  : > "$dir/github_output"
+  if ! env GITHUB_OUTPUT="$dir/github_output" GITHUB_REF="$2" KIT_REF="$3" PROJECT_DIR="$dir" \
+    bash "$script" > "$dir/log" 2>&1; then
+    cat "$dir/log" >&2
+    fail "$1: the script failed"
+  fi
+  ref=$(sed -n 's/^ref=//p' "$dir/github_output")
+  rev=$(sed -n 's/^revision=//p' "$dir/github_output")
+}
+
+expect() { # <case> <want ref> <want revision>
+  if [ "$ref" != "$2" ] || [ "$rev" != "$3" ]; then
+    fail "$1: got '$ref $rev', want '$2 $3'"
+  fi
 }
 
 master=$(git ls-remote "$kit_url" refs/heads/master | cut -f1)
 newest=$(git ls-remote --tags --refs --sort=-version:refname "$kit_url" 'v*.*.*' \
   | cut -f2 | sed 's#^refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
-[ -n "$master" ] && [ -n "$newest" ] || fail "cannot read the kit's master and tags"
+if [ -z "$master" ] || [ -z "$newest" ]; then fail "cannot read the kit's master and tags"; fi
 tag_commit() { git ls-remote "$kit_url" "refs/tags/$1^{}" "refs/tags/$1" | head -n1 | cut -f1; }
 
-read -r ref rev < <(resolve develop refs/heads/develop "")
-[ "$ref" = master ] && [ "$rev" = "$master" ] || fail "develop: got '$ref $rev', want 'master $master'"
+resolve develop refs/heads/develop ""
+expect develop master "$master"
 grep -q 'branch = "master"' "$work/develop/pyproject.toml" || fail "develop: pyproject.toml was rewritten"
 echo "ok develop → master ${rev::7}"
 
-read -r ref rev < <(resolve main refs/heads/main "")
-want=$(tag_commit "$newest")
-[ "$ref" = "$newest" ] && [ "$rev" = "$want" ] || fail "main: got '$ref $rev', want '$newest $want'"
+resolve main refs/heads/main ""
+expect main "$newest" "$(tag_commit "$newest")"
 grep -q "tag = \"${newest}\"" "$work/main/pyproject.toml" || fail "main: pyproject.toml not on tag = \"$newest\""
 echo "ok main → ${newest} ${rev::7}"
 
-read -r ref rev < <(resolve hold refs/heads/develop v0.1.0)
-want=$(tag_commit v0.1.0)
-[ "$ref" = v0.1.0 ] && [ "$rev" = "$want" ] || fail "hold: got '$ref $rev', want 'v0.1.0 $want'"
+resolve hold refs/heads/develop v0.1.0
+expect hold v0.1.0 "$(tag_commit v0.1.0)"
 echo "ok KIT_REF=v0.1.0 on develop → v0.1.0 ${rev::7}"
 
 # A consumer not on branch = "master" is refused, not silently left alone.

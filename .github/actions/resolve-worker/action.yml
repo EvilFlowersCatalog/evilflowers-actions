@@ -1,0 +1,35 @@
+name: resolve-worker
+description: >-
+  Lock evilflowers-worker to the kit ref this build's branch follows (develop and PRs: master; main, master and
+  tags: the newest vX.Y.Z; kit-ref overrides both), for this run only. Needs uv on PATH (astral-sh/setup-uv).
+
+# Side effect: pyproject.toml [tool.uv.sources] → tag = "<ref>" when the ref is a tag, and uv.lock locked to it.
+# The caller uploads both as the artifact image.yml builds from (input `artifact`). Nothing is committed.
+
+inputs:
+  kit-ref:
+    description: Hold, e.g. v0.3.1 or a kit branch (pass vars.KIT_REF). Empty — the rule above.
+    required: false
+    default: ""
+  working-directory:
+    description: Directory holding pyproject.toml and uv.lock
+    required: false
+    default: .
+
+outputs:
+  ref:
+    description: Kit ref the lock follows (master | vX.Y.Z | <branch>)
+    value: ${{ steps.resolve.outputs.ref }}
+  revision:
+    description: Kit commit uv.lock pins (40 hex)
+    value: ${{ steps.resolve.outputs.revision }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        KIT_REF: ${{ inputs.kit-ref }}
+        PROJECT_DIR: ${{ inputs.working-directory }}
+      run: bash "$GITHUB_ACTION_PATH/resolve-worker.sh"

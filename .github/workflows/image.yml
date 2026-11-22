@@ -10,6 +10,10 @@ name: image
 #   other branches           :sha-<short>
 #   pull request             nothing (build and smoke test only)
 #
+# A kit consumer passes `artifact` (the pyproject.toml + uv.lock resolve-worker locked) and `worker-revision` /
+# `worker-ref`: the image is built from that lock and labelled sk.stuba.elvira.evilflowers-worker.{revision,ref},
+# which worker-nightly.yml compares with the kit's master.
+#
 # The caller grants: contents: read, packages: write, id-token: write, attestations: write.
 
 on:
@@ -45,6 +49,24 @@ on:
           local daemon as $SMOKE_IMAGE, built for the first platform only.
         type: string
         default: ""
+      artifact:
+        description: >-
+          Artifact of this run downloaded over the checkout before the build, e.g. the pyproject.toml + uv.lock
+          resolve-worker locked and the tests ran against
+        type: string
+        default: ""
+      artifact-path:
+        description: Where the artifact is extracted, relative to the workspace
+        type: string
+        default: .
+      worker-revision:
+        description: evilflowers-worker commit (resolve-worker output `revision`); label + build arg EVILFLOWERS_WORKER_REVISION
+        type: string
+        default: ""
+      worker-ref:
+        description: evilflowers-worker ref (resolve-worker output `ref`); label
+        type: string
+        default: ""
     outputs:
       digest:
         description: Digest of the pushed image (sha256:…), empty on a pull request
@@ -77,10 +99,18 @@ jobs:
         with:
           persist-credentials: false
 
+      # The lock the tests ran against, over the committed one: the tested and the shipped kit commit are the same.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: inputs.artifact != ''
+        with:
+          name: ${{ inputs.artifact }}
+          path: ${{ inputs.artifact-path }}
+
       - id: vars
         env:
           CACHE: ${{ inputs.cache }}
           PLATFORMS: ${{ inputs.platforms }}
+          WORKER_REVISION: ${{ inputs.worker-revision }}
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           case "$CACHE" in
@@ -96,11 +126,16 @@ jobs:
           esac
           # A pull request pushes nothing, the registry cache included.
           [ "$PUSH" = true ] || [ "$CACHE" = gha ] || to=""
+          # Build args after IMAGE_TAG: the kit commit, when given (EvilFlowersCatalog/evilflowers-worker#13).
           {
             echo "image=$image"
             echo "cache-from=$from"
             echo "cache-to=$to"
             echo "smoke-platform=${PLATFORMS%%,*}"
+            echo "build-args<<EOF_BUILD_ARGS"
+            echo "IMAGE_TAG=${GITHUB_REF_NAME}@${GITHUB_SHA}"
+            if [ -n "$WORKER_REVISION" ]; then echo "EVILFLOWERS_WORKER_REVISION=${WORKER_REVISION}"; fi
+            echo "EOF_BUILD_ARGS"
           } >> "$GITHUB_OUTPUT"
 
       - name: Prepare
@@ -130,6 +165,10 @@ jobs:
             type=raw,value=${{ github.ref_name }},enable=${{ github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' }}
             type=match,pattern=^v?(\d+\.\d+\.\d+)$,group=1
             type=sha,prefix=sha-,format=short
+          # Merged into the OCI labels; an empty line is dropped, so a service without the kit gets none.
+          labels: |
+            ${{ inputs.worker-revision != '' && format('sk.stuba.elvira.evilflowers-worker.revision={0}', inputs.worker-revision) || '' }}
+            ${{ inputs.worker-ref != '' && format('sk.stuba.elvira.evilflowers-worker.ref={0}', inputs.worker-ref) || '' }}
 
       # Build once into the local daemon and prove the image works before anything is pushed.
       # load cannot hold a multi-platform image, hence the first platform only; the push below
@@ -144,7 +183,7 @@ jobs:
           load: true
           tags: smoke.local/image:${{ github.sha }}
           build-args: |
-            IMAGE_TAG=${{ github.ref_name }}@${{ github.sha }}
+            ${{ steps.vars.outputs.build-args }}
             ${{ inputs.build-args }}
           cache-from: ${{ steps.vars.outputs.cache-from }}
           cache-to: ${{ steps.vars.outputs.cache-to }}
@@ -167,7 +206,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            IMAGE_TAG=${{ github.ref_name }}@${{ github.sha }}
+            ${{ steps.vars.outputs.build-args }}
             ${{ inputs.build-args }}
           cache-from: ${{ steps.vars.outputs.cache-from }}
           cache-to: ${{ steps.vars.outputs.cache-to }}
@@ -186,12 +225,18 @@ jobs:
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
           TAGS: ${{ steps.meta.outputs.tags }}
+          WORKER_REVISION: ${{ inputs.worker-revision }}
+          WORKER_REF: ${{ inputs.worker-ref }}
         run: |
           {
             if [ "$PUSH" = true ]; then echo "### Image pushed"; else echo "### Image built (pull request: not pushed)"; fi
             echo
             echo "Digest \`${DIGEST:-—}\`"
             echo
+            if [ -n "$WORKER_REVISION" ]; then
+              echo "evilflowers-worker \`${WORKER_REF:-?}\` = \`${WORKER_REVISION}\`"
+              echo
+            fi
             echo '```'
             echo "$TAGS"
             echo '```'

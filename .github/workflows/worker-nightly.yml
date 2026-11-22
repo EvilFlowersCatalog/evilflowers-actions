@@ -1,0 +1,121 @@
+name: worker-nightly
+
+# Reusable: put dev on the newest evilflowers-worker. Rule 3 of EvilFlowersCatalog/evilflowers-worker#13.
+# Diagram: docs/diagrams/sequence-worker-nightly.puml
+#
+#   1. evilflowers-worker `master` → its head commit (git ls-remote)
+#   2. the kit commit inside ghcr.io/<owner>/<repo>:develop (label sk.stuba.elvira.evilflowers-worker.revision,
+#      set by image.yml from resolve-worker)
+#   3. different, no label, or force → `gh workflow run <workflow> --ref develop -f reason=nightly`; that run
+#      resolves master again, tests, builds, pushes :develop and redeploys dev.
+#      same → nothing: a rebuild of the same code is a new digest, and its rollout restarts dev for nothing.
+#   4. a step summary
+#
+# It never commits and never targets main/master: prod follows the kit's release tags (resolve-worker). A hold
+# (kit-ref, or the caller's repository variable KIT_REF) pauses it: :develop would never match master.
+#
+# The caller grants: actions: write (dispatch), packages: read (the :develop labels).
+
+on:
+  workflow_call:
+    inputs:
+      workflow:
+        description: The caller's build + deploy workflow file (e.g. image.yml); it must accept workflow_dispatch input `reason`
+        type: string
+        required: true
+      force:
+        description: Dispatch even if :develop already has master's evilflowers-worker (ignores a hold)
+        type: boolean
+        default: false
+      kit-ref:
+        description: Hold (default — the caller's vars.KIT_REF). While set, the nightly does nothing.
+        type: string
+        default: ""
+      image:
+        description: Image to compare, without tag (default — ghcr.io/<lowercase repository>)
+        type: string
+        default: ""
+    outputs:
+      dispatched:
+        description: "'true' when the workflow was dispatched"
+        value: ${{ jobs.nightly.outputs.dispatched }}
+
+permissions: {}
+
+jobs:
+  nightly:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      packages: read
+    concurrency:
+      group: worker-nightly-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      dispatched: ${{ steps.compare.outputs.build }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KIT: https://github.com/EvilFlowersCatalog/evilflowers-worker
+      FORCE: ${{ inputs.force }}
+      HOLD: ${{ inputs.kit-ref || vars.KIT_REF }}
+      IMAGE: ${{ inputs.image }}
+      WORKFLOW: ${{ inputs.workflow }}
+    steps:
+      - name: Compare master with :develop
+        id: compare
+        run: |
+          head=$(git ls-remote "$KIT" refs/heads/master | cut -f1)
+          [ -n "$head" ] || { echo "::error::cannot resolve evilflowers-worker master"; exit 1; }
+
+          image="${IMAGE:-ghcr.io/${GITHUB_REPOSITORY,,}}:develop"
+          running=$(skopeo inspect --creds "${GITHUB_ACTOR}:${GH_TOKEN}" "docker://${image}" \
+            | jq -r '.Labels["sk.stuba.elvira.evilflowers-worker.revision"] // ""') || running=""
+
+          {
+            echo "head=$head"
+            echo "running=$running"
+            echo "image=$image"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" = true ]; then
+            build=true
+            echo "::notice::force: rebuilding develop on evilflowers-worker ${head::7}"
+          elif [ -n "$HOLD" ]; then
+            build=false
+            echo "::notice::evilflowers-worker is held at ${HOLD} (KIT_REF): nothing to do"
+          elif [ "$head" = "$running" ]; then
+            build=false
+            echo "::notice::${image} already has evilflowers-worker ${head::7}"
+          else
+            build=true
+            echo "::notice::evilflowers-worker ${running:-(no label)} → ${head::7}"
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch ${{ inputs.workflow }} on develop
+        if: steps.compare.outputs.build == 'true'
+        run: gh workflow run "$WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref develop -f reason=nightly
+
+      - name: Summary
+        if: always()
+        env:
+          HEAD: ${{ steps.compare.outputs.head }}
+          RUNNING: ${{ steps.compare.outputs.running }}
+          BUILD: ${{ steps.compare.outputs.build }}
+          IMAGE_REF: ${{ steps.compare.outputs.image }}
+          STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### Nightly evilflowers-worker: ${STATUS}"
+            echo
+            echo "- evilflowers-worker master: \`${HEAD::7}\`"
+            echo "- In \`${IMAGE_REF}\`: \`${RUNNING:-no label}\`"
+            if [ -n "$HOLD" ]; then echo "- Hold: \`${HOLD}\`"; fi
+            echo
+            if [ "$BUILD" = true ]; then
+              echo "Dispatched \`${WORKFLOW}\` on develop (reason=nightly)."
+            else
+              echo "Nothing to build."
+            fi
+            echo
+            echo "The deploy lands in Loki: \`{service_name=\"github-actions\"} | event_name=\"deployment\" | evilflowers_deploy_trigger=\"nightly\"\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -15,12 +15,13 @@ jobs:
         with:
           persist-credentials: false
 
-      # actionlint runs shellcheck on every run: block too (the image bundles it).
+      # actionlint runs shellcheck on every run: block of the workflows (the image bundles it). It does not read
+      # the composite actions under .github/actions/; their scripts are covered below.
       - name: actionlint
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
 
       - name: shellcheck
-        run: shellcheck scripts/*.sh
+        run: shellcheck scripts/*.sh tests/*.sh .github/actions/*/*.sh
 
       # The telemetry contract, without a collector: the payloads are valid JSON with the
       # expected shape, and a missing endpoint is a warning, never a failure.
@@ -33,10 +34,14 @@ jobs:
           IMAGE: ghcr.io/evilflowerscatalog/example
           DEPLOY_START_NS: "1700000000000000000"
           DEPLOY_END_NS: "1700000060000000000"
+          TRIGGER: nightly
+          WORKER_REVISION: eb1d19cef63c9e1570a9fd52bf37632249c7c161
+          WORKER_REF: master
         run: |
           unset GITHUB_OUTPUT
           scripts/otlp-deploy.sh --print failed > "$RUNNER_TEMP/payloads"
-          python3 - "$RUNNER_TEMP/payloads" <<'EOF'
+          env -u WORKER_REVISION -u WORKER_REF scripts/otlp-deploy.sh --print succeeded > "$RUNNER_TEMP/payloads-nokit"
+          python3 - "$RUNNER_TEMP/payloads" "$RUNNER_TEMP/payloads-nokit" <<'EOF'
           import json, sys
           logs, traces = (json.loads(l) for l in open(sys.argv[1]))
           records = logs["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
@@ -46,7 +51,59 @@ jobs:
           assert all(r["traceId"] == span["traceId"] and r["spanId"] == span["spanId"] for r in records)
           assert span["name"] == "deploy" and span["status"]["code"] == 2
           assert span["startTimeUnixNano"] == "1700000000000000000"
+          attrs = lambda item: {a["key"]: a["value"].get("stringValue") for a in item["attributes"]}
+          want = {
+              "evilflowers.deploy.trigger": "nightly",
+              "evilflowers.worker.revision": "eb1d19cef63c9e1570a9fd52bf37632249c7c161",
+              "evilflowers.worker.ref": "master",
+          }
+          for item in [*records, span]:
+              assert want.items() <= attrs(item).items(), attrs(item)
+          # A service without the kit sends the trigger but no empty worker attributes.
+          logs, traces = (json.loads(l) for l in open(sys.argv[2]))
+          span = traces["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+          assert attrs(span)["evilflowers.deploy.trigger"] == "nightly"
+          assert not any(k.startswith("evilflowers.worker.") for k in attrs(span))
           print("payloads ok")
           EOF
           env -u ELVIRA_OTLP_HTTP_ENDPOINT scripts/otlp-deploy.sh succeeded
           ELVIRA_OTLP_HTTP_ENDPOINT=http://127.0.0.1:9 scripts/otlp-deploy.sh succeeded
+
+  # resolve-worker against the real kit: develop → master, main → newest vX.Y.Z, a KIT_REF hold, a pinned source.
+  resolve-worker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      - name: resolve-worker.sh
+        run: tests/resolve-worker.sh
+
+      # The composite action itself, as a caller uses it.
+      - name: Throwaway consumer
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer"
+          printf '%s\n' \
+            '[project]' 'name = "consumer"' 'version = "0"' 'requires-python = ">=3.12"' \
+            'dependencies = ["evilflowers-worker"]' '' '[tool.uv.sources]' \
+            'evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", branch = "master" }' \
+            > "$RUNNER_TEMP/consumer/pyproject.toml"
+
+      - id: worker
+        uses: ./.github/actions/resolve-worker
+        with:
+          kit-ref: v0.1.0
+          working-directory: ${{ runner.temp }}/consumer
+
+      - name: Outputs
+        env:
+          REF: ${{ steps.worker.outputs.ref }}
+          REVISION: ${{ steps.worker.outputs.revision }}
+        run: |
+          echo "ref=$REF revision=$REVISION"
+          [ "$REF" = v0.1.0 ]
+          [ "$REVISION" = eb1d19cef63c9e1570a9fd52bf37632249c7c161 ]
+          grep -q 'tag = "v0.1.0"' "$RUNNER_TEMP/consumer/pyproject.toml"

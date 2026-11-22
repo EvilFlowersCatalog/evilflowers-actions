@@ -89,6 +89,8 @@ Before the first push:
 | `context`, `file` | `.`, `<context>/Dockerfile` | |
 | `prepare` | `""` | Shell command run after checkout, before the build. The catalog uses it for `poetry export … > requirements.txt`. |
 | `smoke-test` | `""` | Shell command run before anything is pushed. It runs against an image built for the first platform and loaded as `$SMOKE_IMAGE`. |
+| `artifact`, `artifact-path` | `""`, `.` | An artifact of this run, downloaded over the checkout before the build. A kit consumer passes the `pyproject.toml` + `uv.lock` that `resolve-worker` locked. |
+| `worker-revision`, `worker-ref` | `""` | Labels `sk.stuba.elvira.evilflowers-worker.revision` / `.ref`, plus the build arg `EVILFLOWERS_WORKER_REVISION`. Set only when given. |
 
 Outputs: `digest` (empty on a PR), `image` (`ghcr.io/<owner>/<repo>`), `tags`. Every pushed image
 gets provenance, an SBOM and a GitHub build-provenance attestation.
@@ -110,6 +112,8 @@ The OCR service's smoke test as an example:
 | `image-label` | lowercase repository name | The catalog passes `evilflowers-catalog`. |
 | `timeout` | `900s` | `rollout status` timeout, per Deployment. |
 | `actions-ref` | `v1` | Ref of this repository to load `scripts/otlp-deploy.sh` from. Keep it equal to the `@ref` you call. Set it only while testing a branch or SHA. |
+| `reason` | `""` | Sent as `evilflowers.deploy.trigger`. Pass the caller's dispatch input `reason`. If empty, it is `push`, or `manual` for a dispatch. |
+| `worker-revision`, `worker-ref` | `""` | Sent as `evilflowers.worker.revision` / `.ref`, and only when set. |
 
 What the `rollout` job does on the `elvira-k3s` runner:
 
@@ -125,6 +129,153 @@ namespace at a time.
 
 The digest check is strict. A pod matched by the selector fails it if any of its containers
 (a sidecar, for example) runs a different image.
+
+## Services built on evilflowers-worker
+
+Rule set: EvilFlowersCatalog/evilflowers-worker#13. Diagram:
+[`docs/diagrams/sequence-worker-nightly.puml`](docs/diagrams/sequence-worker-nightly.puml).
+
+The kit is resolved at build time, never committed. The source in `pyproject.toml` stays on
+`branch = "master"`:
+
+```toml
+[tool.uv.sources]
+evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", branch = "master" }
+```
+
+| Service ref | Kit ref the build locks |
+|---|---|
+| `develop`, PRs, other branches | `master` head |
+| `main` / `master`, tags | newest `vX.Y.Z`. If no tag exists, the build fails. |
+| repository variable `KIT_REF` set | that ref: a hold on a known-good tag, or a test of a kit branch. It also pauses the nightly. |
+
+Cut a kit tag before you merge a service's `develop` → `main`. Otherwise the `main` build locks an
+older kit than the one `develop` was tested against.
+
+### The image workflow of a kit consumer
+
+```yaml
+on:
+  push:
+    branches: [develop, master, main]
+    tags: ["*.*.*", "v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: push | nightly | manual (worker-nightly.yml sends nightly)
+        type: string
+        default: manual
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    outputs:
+      worker-revision: ${{ steps.worker.outputs.revision }}
+      worker-ref: ${{ steps.worker.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - id: worker
+        uses: EvilFlowersCatalog/evilflowers-actions/.github/actions/resolve-worker@v1
+        with:
+          kit-ref: ${{ vars.KIT_REF }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: uv-lock
+          path: |
+            pyproject.toml
+            uv.lock
+      - run: uv sync --locked && uv run pytest
+
+  image:
+    needs: test
+    uses: EvilFlowersCatalog/evilflowers-actions/.github/workflows/image.yml@v1
+    permissions: { contents: read, packages: write, id-token: write, attestations: write }
+    with:
+      artifact: uv-lock
+      worker-revision: ${{ needs.test.outputs.worker-revision }}
+      worker-ref: ${{ needs.test.outputs.worker-ref }}
+
+  deploy:
+    needs: [test, image]
+    if: github.event_name != 'pull_request'
+    uses: EvilFlowersCatalog/evilflowers-actions/.github/workflows/deploy.yml@v1
+    with:
+      digest: ${{ needs.image.outputs.digest }}
+      reason: ${{ inputs.reason }}
+      worker-revision: ${{ needs.test.outputs.worker-revision }}
+      worker-ref: ${{ needs.test.outputs.worker-ref }}
+
+  report-nightly-failure:
+    needs: [test, image, deploy]
+    if: failure() && inputs.reason == 'nightly'
+    runs-on: ubuntu-24.04
+    permissions: { issues: write }
+    steps:
+      - uses: EvilFlowersCatalog/evilflowers-actions/.github/actions/report-nightly-failure@v1
+        with:
+          revision: ${{ needs.test.outputs.worker-revision }}
+          results: test=${{ needs.test.result }} image=${{ needs.image.result }} deploy=${{ needs.deploy.result }}
+```
+
+The deploy condition is `github.event_name != 'pull_request'`, not `== 'push'`, because the nightly
+arrives as a `workflow_dispatch`. `deploy.yml` still deploys only `develop`, and later `master`/`main`.
+
+### The nightly
+
+```yaml
+name: nightly
+
+on:
+  schedule: [{ cron: "17 2 * * *" }]
+  workflow_dispatch:
+    inputs:
+      force: { type: boolean, default: false }
+
+permissions: {}
+
+jobs:
+  nightly:
+    uses: EvilFlowersCatalog/evilflowers-actions/.github/workflows/worker-nightly.yml@v1
+    permissions: { actions: write, packages: read }
+    with:
+      workflow: image.yml
+      force: ${{ inputs.force || false }}
+```
+
+`schedule` fires only from the default branch, so the nightly runs once this file is on `main`/`master`.
+On each run it:
+
+1. Reads the kit's `master` head with `git ls-remote`.
+2. Reads the label `sk.stuba.elvira.evilflowers-worker.revision` of `ghcr.io/<repository>:develop`.
+3. If the two differ, the label is missing, or `force` is set, it dispatches `workflow` on `develop`
+   with `reason=nightly`.
+4. Writes a step summary.
+
+A hold (`KIT_REF`) makes it do nothing, unless `force` is set. It never commits and never builds
+`main`/`master`.
+
+### `resolve-worker`
+
+| Input | Default | Use |
+|---|---|---|
+| `kit-ref` | `""` | Pass `${{ vars.KIT_REF }}`. A composite action cannot read `vars` itself. |
+| `working-directory` | `.` | The directory that holds `pyproject.toml` and `uv.lock`. |
+
+Outputs: `ref` (`master`, `vX.Y.Z`, or a branch) and `revision` (the 40-hex commit `uv.lock` pins).
+
+- It needs `uv` on PATH.
+- When the ref is not `master`, it rewrites the source to `tag = "<ref>"` (or `branch = "<ref>"`).
+- It fails if the source is not on `branch = "master"`.
+
+### `report-nightly-failure`
+
+Inputs: `revision`, `results`, `service` (default: the repository name), `token` (default:
+`github.token`).
+
+It opens `nightly: evilflowers-worker <sha> breaks <service>`. While that issue is open, every
+later failing night comments on it instead of opening a new one.
 
 ## Deployments in LGTM
 
@@ -143,6 +294,8 @@ What gets sent:
 - Loki: one log record per restarted Deployment, with `event.name=deployment`,
   `k8s.deployment.name`, `deployment.status` (`succeeded` / `failed`), and the `vcs.*`,
   `cicd.pipeline.*`, `oci.manifest.digest` and `container.image.name` attributes.
+- On the records and on the span: `evilflowers.deploy.trigger` (`push` | `nightly` | `manual`). For
+  services built on the kit, also `evilflowers.worker.revision` and `evilflowers.worker.ref`.
 - Tempo: one span `deploy` per job, from the restart to the end of the digest check. Its status is
   ERROR on failure.
 
@@ -212,14 +365,18 @@ What `v1` promises:
 `self-test.yml` runs on every push. It covers:
 
 - actionlint, which also runs shellcheck on every `run:` block;
-- shellcheck on `scripts/`;
-- a contract test of `otlp-deploy.sh`'s payloads.
+- shellcheck on `scripts/`, `tests/` and the scripts of the composite actions (actionlint does not
+  read `.github/actions/`);
+- a contract test of `otlp-deploy.sh`'s payloads;
+- `tests/resolve-worker.sh` against the real kit: a develop build, a main build, a hold, and a
+  pinned source. Then the `resolve-worker` action itself, run as a caller would run it.
 
 To run the same checks locally:
 
 ```bash
 docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
-docker run --rm -v "$PWD:/repo" -w /repo koalaman/shellcheck:stable scripts/*.sh
+docker run --rm -v "$PWD:/repo" -w /repo koalaman/shellcheck:stable scripts/*.sh tests/*.sh .github/actions/*/*.sh
+tests/resolve-worker.sh   # needs git, uv and network
 ```
 
 `.github/actionlint.yaml` declares the self-hosted label `elvira-k3s`.

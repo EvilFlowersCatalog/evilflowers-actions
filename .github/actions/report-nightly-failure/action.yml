@@ -1,0 +1,73 @@
+name: report-nightly-failure
+description: >-
+  A failed nightly (worker-nightly.yml dispatched the caller's image workflow with reason=nightly) becomes an issue:
+  "nightly: evilflowers-worker <sha> breaks <service>". One open issue per streak: while one is open, the next
+  failing night comments on it. Needs issues: write.
+
+# The caller job owns the condition and the results, e.g.
+#   needs: [test, image, deploy]
+#   if: failure() && inputs.reason == 'nightly'
+#   permissions: { issues: write }
+
+inputs:
+  revision:
+    description: Kit commit the failed build resolved (resolve-worker output `revision`; empty if it never resolved)
+    required: false
+    default: ""
+  results:
+    description: What failed, e.g. "test=failure image=skipped deploy=skipped"
+    required: false
+    default: ""
+  service:
+    description: Name in the issue title (default — the repository name)
+    required: false
+    default: ""
+  token:
+    description: Token with issues write on this repository
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  issue:
+    description: Number of the issue opened or commented on
+    value: ${{ steps.report.outputs.issue }}
+
+runs:
+  using: composite
+  steps:
+    - id: report
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GH_REPO: ${{ github.repository }}
+        REVISION: ${{ inputs.revision }}
+        RESULTS: ${{ inputs.results }}
+        SERVICE: ${{ inputs.service }}
+      run: |
+        service="${SERVICE:-${GITHUB_REPOSITORY#*/}}"
+        run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT:-1}"
+        if [ -n "$REVISION" ]; then
+          kit="https://github.com/EvilFlowersCatalog/evilflowers-worker/commit/${REVISION}"
+        else
+          kit="not resolved"
+        fi
+        body=$(printf '%s\n' \
+          "The nightly build of ${service} on evilflowers-worker \`${REVISION:-unresolved}\` failed${RESULTS:+ (${RESULTS})}." \
+          "dev keeps running the previous image." \
+          "" \
+          "- Run: ${run_url}" \
+          "- Kit commit: ${kit}" \
+          "- Reproduce: \`uv lock --upgrade-package evilflowers-worker && uv run pytest\`" \
+          "- Hold dev on a known-good kit meanwhile: repository variable \`KIT_REF\` (e.g. the last release tag)")
+        existing=$(gh issue list --state open --search 'in:title "nightly: evilflowers-worker"' \
+          --json number,title --jq '[.[] | select(.title | startswith("nightly: evilflowers-worker"))][0].number // empty')
+        if [ -n "$existing" ]; then
+          gh issue comment "$existing" --body "$body"
+          issue=$existing
+        else
+          short="${REVISION:0:7}"
+          url=$(gh issue create --title "nightly: evilflowers-worker ${short:-unresolved} breaks ${service}" --body "$body")
+          issue=${url##*/}
+        fi
+        echo "issue=$issue" >> "$GITHUB_OUTPUT"
+        echo "::notice::nightly failure reported on #${issue}"
